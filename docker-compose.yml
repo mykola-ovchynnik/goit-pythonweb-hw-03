@@ -1,0 +1,10 @@
+version: '3.8'
+
+services:
+  web:
+    image: my-python-app
+    container_name: my-python-app-container
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./storage:/app/storage

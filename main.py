@@ -1,3 +1,4 @@
+import logging
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import urllib.parse
 import mimetypes
@@ -5,46 +6,79 @@ import pathlib
 import json
 from datetime import datetime
 import os
+from jinja2 import Environment, FileSystemLoader
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
 
 class HttpHandler(BaseHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        self.file_handler = FileHandler("storage/data.json")
+        self.env = Environment(loader=FileSystemLoader("templates"))
+        super().__init__(*args, **kwargs)
+
     def do_GET(self):
-        pr_url = urllib.parse.urlparse(self.path)
-        if pr_url.path == '/':
-            self.send_html_file('index.html')
-        elif pr_url.path == '/message':
-            self.send_html_file('message.html')
+        url = urllib.parse.urlparse(self.path)
+        logging.info(f"Handling GET request for {url.path}")
+        if url.path == "/":
+            self.render_template("index.html")
+        elif url.path == "/message":
+            self.render_template("message.html")
+        elif url.path == "/read":
+            data = self.file_handler.read_json_file()
+            self.render_template("read.html", messages=data)
         else:
-            if pathlib.Path().joinpath(pr_url.path[1:]).exists():
+            if pathlib.Path().joinpath(url.path[1:]).exists():
                 self.send_static()
             else:
-                self.send_html_file('error.html', 404)
+                self.render_template("error.html", 404)
 
     def do_POST(self):
-        if self.path == '/message':
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
-            data_parse = urllib.parse.unquote_plus(post_data.decode())
-            data_dict = {key: value for key, value in [el.split('=') for el in data_parse.split('&')]}
+        if self.path == "/message":
+            post_data = self.parse_post_data()
             timestamp = datetime.now().isoformat()
 
-            storage_dir = 'storage'
-            data_file = os.path.join(storage_dir, 'data.json')
-            os.makedirs(storage_dir, exist_ok=True)
+            data = self.file_handler.read_json_file()
+            data[timestamp] = post_data
+            self.file_handler.write_json_file(data)
 
-            data = read_json_file(data_file)
-            data[timestamp] = data_dict
-            write_json_file(data_file, data)
+            logging.info(f"Message received and stored at {timestamp}")
+            self.send_response_headers(302, "text/html", "/read")
 
-            self.send_response(302)
-            self.send_header('Location', '/')
-            self.end_headers()
+    def parse_post_data(self):
+        content_length = int(self.headers["Content-Length"])
+        post_data = self.rfile.read(content_length)
+        data = urllib.parse.unquote_plus(post_data.decode())
+        logging.info(f"Parsed POST data: {data}")
+        return {key: value for key, value in [el.split("=") for el in data.split("&")]}
 
-    def send_html_file(self, filename, status=200):
+    def render_template(self, template_name, status=200, **context):
+        try:
+            self.send_response_headers(status, "text/html")
+            template = self.env.get_template(template_name)
+            rendered_html = template.render(**context)
+            self.wfile.write(rendered_html.encode())
+            logging.info(f"Rendered template {template_name} with status {status}")
+        except FileNotFoundError:
+            self.send_response_headers(404, "text/html")
+            self.wfile.write(b"File not found")
+            logging.error(f"Template {template_name} not found")
+        except Exception as e:
+            self.send_response_headers(500, "text/html")
+            self.wfile.write(f"Internal server error: {e}".encode())
+            logging.error(f"Error rendering template {template_name}: {e}")
+
+    def send_response_headers(self, status, content_type, location=None):
         self.send_response(status)
-        self.send_header('Content-type', 'text/html')
+        self.send_header("Content-type", content_type)
+        if status == 302 and location:
+            self.send_header("Location", location)
         self.end_headers()
-        with open(filename, 'rb') as fd:
-            self.wfile.write(fd.read())
+        logging.info(
+            f"Sent response headers with status {status} and content type {content_type}"
+        )
 
     def send_static(self):
         self.send_response(200)
@@ -52,37 +86,48 @@ class HttpHandler(BaseHTTPRequestHandler):
         if mimetype:
             self.send_header("Content-type", mimetype[0])
         else:
-            self.send_header("Content-type", 'text/plain')
+            self.send_header("Content-type", "text/plain")
         self.end_headers()
-        with open(f'.{self.path}', 'rb') as file:
+        with open(f".{self.path}", "rb") as file:
             self.wfile.write(file.read())
+        logging.info(f"Served static file {self.path}")
 
-def read_json_file(filepath):
+
+class FileHandler:
+    def __init__(self, filename):
+        self.filename = filename
+
+    def read_json_file(self):
+        try:
+            if os.path.exists(self.filename):
+                with open(self.filename, "r", encoding="utf-8") as file:
+                    logging.info(f"Reading JSON file {self.filename}")
+                    return json.load(file)
+        except (json.JSONDecodeError, OSError) as e:
+            logging.error(f"Error reading JSON file {self.filename}: {e}")
+        return {}
+
+    def write_json_file(self, data):
+        temp_filepath = self.filename + ".tmp"
+        try:
+            with open(temp_filepath, "w", encoding="utf-8") as file:
+                json.dump(data, file, indent=4)
+            os.replace(temp_filepath, self.filename)
+            logging.info(f"Written JSON data to {self.filename}")
+        except OSError as e:
+            logging.error(f"Error writing JSON file {self.filename}: {e}")
+
+
+def run(server=HTTPServer, request_handler=HttpHandler):
+    server_address = ("", 3000)
+    server_instance = server(server_address, request_handler)
+    logging.info("Starting server at localhost:3000")
     try:
-        if os.path.exists(filepath):
-            with open(filepath, 'r', encoding='utf-8') as file:
-                return json.load(file)
-    except (json.JSONDecodeError, OSError) as e:
-        print(f"Error reading JSON file {filepath}: {e}")
-    return {}
-
-
-def write_json_file(filepath, data):
-    temp_filepath = filepath + '.tmp'
-    try:
-        with open(temp_filepath, 'w', encoding='utf-8') as file:
-            json.dump(data, file, indent=4)
-        os.replace(temp_filepath, filepath)
-    except OSError as e:
-        print(f"Error writing JSON file {filepath}: {e}")
-
-def run(server_class=HTTPServer, handler_class=HttpHandler):
-    server_address = ('', 3000)
-    http = server_class(server_address, handler_class)
-    try:
-        http.serve_forever()
+        server_instance.serve_forever()
     except KeyboardInterrupt:
-        http.server_close()
+        server_instance.server_close()
+        logging.info("Server stopped")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     run()
